@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,10 +21,13 @@ func env(key, def string) string {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	pool, err := db.NewPool(context.Background(),
 		env("DATABASE_URL", "postgres://seat:seat@localhost:5432/seatres"))
 	if err != nil {
-		log.Fatalf("cannot connect to database: %v", err)
+		slog.Error("cannot connect to database", "error", err.Error())
+		os.Exit(1)
 	}
 
 	a := &auth.Auth{
@@ -36,16 +39,17 @@ func main() {
 
 	go func() {
 		if err := app.Listen(":" + port); err != nil {
-			log.Fatalf("listen: %v", err)
+			slog.Error("listen failed", "error", err.Error())
+			os.Exit(1)
 		}
 	}()
-	log.Printf("listening on :%s", port)
+	slog.Info("listening", "port", port)
 
 	// Wait for Ctrl+C (or SIGTERM from the hosting platform), then drain.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-	log.Println("shutting down: finishing in-flight requests")
+	slog.Info("shutting down: finishing in-flight requests")
 	_ = app.ShutdownWithTimeout(15 * time.Second)
 	pool.Close()
 }

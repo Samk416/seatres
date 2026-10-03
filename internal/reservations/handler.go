@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Samk416/seatres/internal/auth"
+	"github.com/Samk416/seatres/internal/metrics"
 	"github.com/Samk416/seatres/internal/validate"
 )
 
@@ -118,13 +119,20 @@ func (h *Handler) Reserve(c *fiber.Ctx) error {
 	})
 	var d *decline
 	if errors.As(err, &d) {
+		metrics.Declined.WithLabelValues(d.Reason).Inc()
+		c.Locals("reason", d.Reason) // shows up in the request log line
 		return c.Status(d.Status).JSON(fiber.Map{"error": d.Reason, "message": d.Msg})
 	}
 	if err != nil {
 		return err
 	}
+	// Counted once, after any retries have finished.
 	if replayed {
+		metrics.Declined.WithLabelValues("idempotent_replay").Inc()
+		c.Locals("reason", "idempotent_replay")
 		c.Set("Idempotent-Replay", "true")
+	} else {
+		metrics.Confirmed.Inc()
 	}
 	return c.Status(fiber.StatusCreated).JSON(res)
 }

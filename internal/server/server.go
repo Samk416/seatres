@@ -5,21 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	recovermw "github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Samk416/seatres/internal/auth"
+	"github.com/Samk416/seatres/internal/metrics"
 	"github.com/Samk416/seatres/internal/reservations"
 	"github.com/Samk416/seatres/internal/shows"
 )
 
 const requestTimeout = 30 * time.Second
 
-// errorHandler is the single place where unexpected errors become responses.
 // errorHandler is the single place where unexpected errors become responses.
 func errorHandler(c *fiber.Ctx, err error) error {
 	var fe *fiber.Error
@@ -39,7 +41,8 @@ func errorHandler(c *fiber.Ctx, err error) error {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error": "overloaded", "message": "request timed out waiting for the database; retry"})
 	}
-	log.Printf("internal error: %s %s: %v", c.Method(), c.Path(), err)
+	slog.Error("internal error",
+		"request_id", c.Locals(requestIDKey), "method", c.Method(), "path", c.Path(), "error", err.Error())
 	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 		"error": "internal_error", "message": "internal error"})
 }
@@ -54,7 +57,22 @@ func withTimeout(d time.Duration) fiber.Handler {
 	}
 }
 
+// ready fails closed: if the database cannot be reached, report not ready.
+func ready(pool *pgxpool.Pool) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"status": "not_ready", "reason": "database unreachable"})
+		}
+		return c.JSON(fiber.Map{"status": "ready"})
+	}
+}
+
 func New(pool *pgxpool.Pool, a *auth.Auth) *fiber.App {
+	known := map[string]bool{} // route patterns, filled in below, used as metric labels
+
 	app := fiber.New(fiber.Config{
 		ErrorHandler:          errorHandler,
 		BodyLimit:             1 << 20, // 1 MB
@@ -63,11 +81,17 @@ func New(pool *pgxpool.Pool, a *auth.Auth) *fiber.App {
 		IdleTimeout:           60 * time.Second,
 		DisableStartupMessage: true,
 	})
+	app.Use(observe(known))  // outermost: sees the final status of every request
 	app.Use(recovermw.New()) // a panic becomes a clean 500, not a dead connection
 	app.Use(withTimeout(requestTimeout))
 
 	sh := &shows.Handler{DB: pool}
 	rh := &reservations.Handler{DB: pool}
+
+	app.Get("/healthz", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"status": "ok"}) })
+	app.Get("/readyz", ready(pool))
+	reg := metrics.NewRegistry(pool)
+	app.Get("/metrics", adaptor.HTTPHandler(promhttp.HandlerFor(reg, promhttp.HandlerOpts{})))
 
 	app.Post("/auth/token", a.IssueToken)
 	app.Get("/me", a.RequireUser, func(c *fiber.Ctx) error {
@@ -77,5 +101,9 @@ func New(pool *pgxpool.Pool, a *auth.Auth) *fiber.App {
 	app.Get("/shows/:id", sh.Get)
 	app.Post("/shows/:id/reserve", a.RequireUser, rh.Reserve)
 	app.Post("/reservations/:id/cancel", a.RequireUser, rh.Cancel)
+
+	for _, r := range app.GetRoutes() {
+		known[r.Path] = true
+	}
 	return app
 }

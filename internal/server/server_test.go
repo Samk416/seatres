@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -557,4 +559,108 @@ func TestMixedLoadNoServerErrors(t *testing.T) {
 		t.Fatalf("invariant broken: %+v", st)
 	}
 	t.Logf("outcomes: %v  final state: %+v", codes, st)
+}
+
+func (e *env) get(path string) string {
+	resp, err := e.client.Get(e.base + path)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+// metricValue reads one series from /metrics, e.g.
+// `reservations_declined_total{reason="seat_taken"}`. Missing series = 0.
+func (e *env) metricValue(t *testing.T, series string) float64 {
+	t.Helper()
+	for _, line := range strings.Split(e.get("/metrics"), "\n") {
+		if strings.HasPrefix(line, series+" ") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, series+" ")), 64)
+			if err != nil {
+				t.Fatalf("bad metric line %q", line)
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+// Metrics must agree with what the API did and with the API's own state.
+func TestMetricsReconcileWithAPI(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2", "A3"})
+	path := "/shows/" + id + "/reserve"
+	u1, _ := e.a.Token("m-user-1")
+	u2, _ := e.a.Token("m-user-2")
+
+	conf := "reservations_confirmed_total"
+	taken := `reservations_declined_total{reason="seat_taken"}`
+	replay := `reservations_declined_total{reason="idempotent_replay"}`
+	c0, t0, r0 := e.metricValue(t, conf), e.metricValue(t, taken), e.metricValue(t, replay)
+
+	body := map[string]any{"seats": []string{"A1"}, "idempotency_key": "m1"}
+	if c, _ := e.do("POST", path, u1, body); c != 201 {
+		t.Fatalf("first reserve: want 201, got %d", c)
+	}
+	if c, _ := e.do("POST", path, u2, map[string]any{"seats": []string{"A1"}, "idempotency_key": "m2"}); c != 409 {
+		t.Fatalf("second user, same seat: want 409, got %d", c)
+	}
+	if c, _ := e.do("POST", path, u1, body); c != 201 { // same key = replay
+		t.Fatalf("replay: want 201, got %d", c)
+	}
+
+	if d := e.metricValue(t, conf) - c0; d != 1 {
+		t.Fatalf("confirmed counter moved by %v, want 1", d)
+	}
+	if d := e.metricValue(t, taken) - t0; d != 1 {
+		t.Fatalf("seat_taken counter moved by %v, want 1", d)
+	}
+	if d := e.metricValue(t, replay) - r0; d != 1 {
+		t.Fatalf("idempotent_replay counter moved by %v, want 1", d)
+	}
+
+	st := e.state(t, id)
+	avail := e.metricValue(t, fmt.Sprintf(`seats_available{show_id="%s"}`, id))
+	if int(avail) != st.available || st.available != 2 {
+		t.Fatalf("seats_available gauge %v vs API %+v", avail, st)
+	}
+}
+
+// Liveness never depends on the DB. Readiness fails closed when the DB is gone.
+func TestHealthAndReadiness(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		url = "postgres://seat:seat@localhost:5432/seatres"
+	}
+	pool, err := db.NewPool(context.Background(), url)
+	if err != nil {
+		t.Fatalf("cannot reach database: %v", err)
+	}
+	defer pool.Close()
+	app := server.New(pool, &auth.Auth{Secret: []byte("s"), AdminToken: "a"})
+
+	status := func(path string) int {
+		resp, err := app.Test(httptest.NewRequest("GET", path, nil), 5000)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if c := status("/healthz"); c != 200 {
+		t.Fatalf("/healthz: want 200, got %d", c)
+	}
+	if c := status("/readyz"); c != 200 {
+		t.Fatalf("/readyz with DB up: want 200, got %d", c)
+	}
+
+	pool.Close() // simulate the database going away
+	if c := status("/healthz"); c != 200 {
+		t.Fatalf("/healthz must not depend on the DB, got %d", c)
+	}
+	if c := status("/readyz"); c != 503 {
+		t.Fatalf("/readyz must fail closed (503) when the DB is down, got %d", c)
+	}
 }
