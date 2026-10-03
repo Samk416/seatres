@@ -45,6 +45,17 @@ func unauthorized(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing or invalid token"})
 }
 
+// Token mints a signed token for a user id.
+func (a *Auth) Token(userID string) (string, error) {
+	now := time.Now()
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Subject:   userID,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(7 * 24 * time.Hour)),
+	})
+	return tok.SignedString(a.Secret)
+}
+
 // POST /auth/token  {"user_id": "alice"}
 func (a *Auth) IssueToken(c *fiber.Ctx) error {
 	var req struct {
@@ -53,13 +64,7 @@ func (a *Auth) IssueToken(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.UserID) == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id is required"})
 	}
-	now := time.Now()
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   req.UserID,
-		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(now.Add(7 * 24 * time.Hour)),
-	})
-	s, err := tok.SignedString(a.Secret)
+	s, err := a.Token(req.UserID)
 	if err != nil {
 		return err
 	}
