@@ -23,10 +23,18 @@ func env(key, def string) string {
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	pool, err := db.NewPool(context.Background(),
-		env("DATABASE_URL", "postgres://seat:seat@localhost:5432/seatres"))
+	pool, err := db.ConnectWithRetry(
+		env("DATABASE_URL", "postgres://seat:seat@localhost:5432/seatres"), 90*time.Second)
 	if err != nil {
 		slog.Error("cannot connect to database", "error", err.Error())
+		os.Exit(1)
+	}
+
+	migCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	err = db.Migrate(migCtx, pool)
+	cancel()
+	if err != nil {
+		slog.Error("migration failed", "error", err.Error())
 		os.Exit(1)
 	}
 

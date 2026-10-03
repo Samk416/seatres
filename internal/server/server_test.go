@@ -40,8 +40,8 @@ func newEnv(t *testing.T) *env {
 		url = "postgres://seat:seat@localhost:5432/seatres"
 	}
 	pool, err := db.NewPool(context.Background(), url)
-	if err != nil {
-		t.Fatalf("cannot reach database (is docker compose up?): %v", err)
+	if err := db.Migrate(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 	t.Cleanup(pool.Close)
 

@@ -1,12 +1,12 @@
-CREATE TABLE shows (
-  id            UUID PRIMARY KEY,
-  name          TEXT NOT NULL,
-  price_paise   BIGINT NOT NULL CHECK (price_paise >= 0),
+CREATE TABLE IF NOT EXISTS shows (
+  id             UUID PRIMARY KEY,
+  name           TEXT NOT NULL,
+  price_paise    BIGINT NOT NULL CHECK (price_paise >= 0),
   per_user_limit INT NOT NULL DEFAULT 4,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE reservations (
+CREATE TABLE IF NOT EXISTS reservations (
   id              UUID PRIMARY KEY,
   show_id         UUID NOT NULL REFERENCES shows(id),
   user_id         TEXT NOT NULL,
@@ -18,7 +18,7 @@ CREATE TABLE reservations (
   UNIQUE (user_id, idempotency_key)
 );
 
-CREATE TABLE seats (
+CREATE TABLE IF NOT EXISTS seats (
   show_id        UUID NOT NULL REFERENCES shows(id),
   seat_no        TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'available'
@@ -28,4 +28,4 @@ CREATE TABLE seats (
   PRIMARY KEY (show_id, seat_no)
 );
 
-CREATE INDEX idx_seats_user ON seats (show_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_seats_user ON seats (show_id, user_id);

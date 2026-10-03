@@ -6,5 +6,20 @@ services:
       POSTGRES_PASSWORD: seat
       POSTGRES_DB: seatres
     ports: ["5432:5432"]
-    volumes:
-      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seat -d seatres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://seat:seat@db:5432/seatres
+      JWT_SECRET: dev-secret-change-me
+      ADMIN_TOKEN: admin-dev-token
+      PORT: "8080"
+    ports: ["8080:8080"]
