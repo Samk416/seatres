@@ -214,3 +214,70 @@ func TestPerUserLimit(t *testing.T) {
 		t.Fatalf("bad state: %+v", st)
 	}
 }
+
+// Same key + same body = same reservation, nothing extra moves.
+// Same key + different seats = 409.
+func TestIdempotency(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2", "A3", "A4"})
+	tok, _ := e.a.Token("retry-user")
+	path := "/shows/" + id + "/reserve"
+
+	c1, r1 := e.do("POST", path, tok, map[string]any{"seats": []string{"A1"}, "idempotency_key": "K1"})
+	if c1 != 201 {
+		t.Fatalf("first request: want 201, got %d", c1)
+	}
+	c2, r2 := e.do("POST", path, tok, map[string]any{"seats": []string{"A1"}, "idempotency_key": "K1"})
+	if c2 != 201 || r2["reservation_id"] != r1["reservation_id"] {
+		t.Fatalf("retry: want 201 with same reservation, got %d %v vs %v", c2, r2, r1)
+	}
+	c3, _ := e.do("POST", path, tok, map[string]any{"seats": []string{"A2"}, "idempotency_key": "K1"})
+	if c3 != 409 {
+		t.Fatalf("same key, different seats: want 409, got %d", c3)
+	}
+	st := e.state(t, id)
+	if st.confirmed != 1 || st.available != 3 {
+		t.Fatalf("retries moved something: %+v", st)
+	}
+}
+
+// 50 simultaneous retries with the same key: one real booking, 49 replays.
+func TestIdempotencyConcurrent(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2"})
+	tok, _ := e.a.Token("retry-storm-user")
+
+	const n = 50
+	codes := make([]int, n)
+	ids := make([]any, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			var out map[string]any
+			codes[i], out = e.do("POST", "/shows/"+id+"/reserve", tok,
+				map[string]any{"seats": []string{"A1"}, "idempotency_key": "same-key"})
+			if out != nil {
+				ids[i] = out["reservation_id"]
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if tc := tally(codes); tc[201] != n {
+		t.Fatalf("want %dx201, got %v", n, tc)
+	}
+	for i := 1; i < n; i++ {
+		if ids[i] != ids[0] {
+			t.Fatalf("different reservation ids: %v vs %v", ids[i], ids[0])
+		}
+	}
+	st := e.state(t, id)
+	if st.confirmed != 1 || st.available != 1 {
+		t.Fatalf("expected exactly one seat booked: %+v", st)
+	}
+}
