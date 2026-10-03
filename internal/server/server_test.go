@@ -179,3 +179,38 @@ func TestMultiSeatAllOrNothing(t *testing.T) {
 		t.Fatalf("invariant broken: %+v", st)
 	}
 }
+
+// One user fires 10 parallel single-seat requests with limit=4:
+// exactly 4 succeed, 6 are declined, and the user ends with 4 seats.
+func TestPerUserLimit(t *testing.T) {
+	e := newEnv(t)
+	seats := []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10"}
+	id := e.createShow(t, seats)
+	tok, _ := e.a.Token("greedy-user")
+
+	codes := make([]int, len(seats))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, s := range seats {
+		wg.Add(1)
+		go func(i int, s string) {
+			defer wg.Done()
+			<-start
+			codes[i], _ = e.do("POST", "/shows/"+id+"/reserve", tok, map[string]any{
+				"seats":           []string{s},
+				"idempotency_key": fmt.Sprintf("limit-key-%d", i),
+			})
+		}(i, s)
+	}
+	close(start)
+	wg.Wait()
+
+	tc := tally(codes)
+	if tc[201] != 4 || tc[409] != 6 {
+		t.Fatalf("want 4x201 and 6x409, got %v", tc)
+	}
+	st := e.state(t, id)
+	if st.confirmed != 4 || st.available != 6 || st.available+st.held+st.confirmed != st.total {
+		t.Fatalf("bad state: %+v", st)
+	}
+}

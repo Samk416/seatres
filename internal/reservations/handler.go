@@ -119,12 +119,37 @@ func (h *Handler) reserve(ctx context.Context, showID uuid.UUID, userID, key str
 	defer tx.Rollback(ctx) // undoes everything unless we Commit
 
 	var price int64
-	err = tx.QueryRow(ctx, `SELECT price_paise FROM shows WHERE id = $1`, showID.String()).Scan(&price)
+	var limit int
+	err = tx.QueryRow(ctx,
+		`SELECT price_paise, per_user_limit FROM shows WHERE id = $1`,
+		showID.String()).Scan(&price, &limit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, &decline{404, "show_not_found", "show not found"}
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	// Serialize this user's reservations for this show. Released at commit/rollback.
+	_, err = tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
+		showID.String()+":"+userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Safe to count now: no other request of this user can run until we finish.
+	var held int
+	err = tx.QueryRow(ctx,
+		`SELECT count(*) FROM seats
+		  WHERE show_id = $1 AND user_id = $2 AND status IN ('held','confirmed')`,
+		showID.String(), userID).Scan(&held)
+	if err != nil {
+		return nil, err
+	}
+	if held+len(seats) > limit {
+		return nil, &decline{409, "per_user_limit",
+			fmt.Sprintf("limit is %d seats per user for this show; you already hold %d", limit, held)}
 	}
 
 	resID := uuid.New()
@@ -155,7 +180,6 @@ func (h *Handler) reserve(ctx context.Context, showID uuid.UUID, userID, key str
 			return nil, err
 		}
 		if tag.RowsAffected() == 0 {
-			// Either the seat does not exist, or somebody else has it.
 			var st string
 			err := tx.QueryRow(ctx,
 				`SELECT status FROM seats WHERE show_id = $1 AND seat_no = $2`,
