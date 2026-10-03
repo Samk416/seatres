@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Samk416/seatres/internal/validate"
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -61,7 +62,7 @@ func (a *Auth) IssueToken(c *fiber.Ctx) error {
 	var req struct {
 		UserID string `json:"user_id"`
 	}
-	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.UserID) == "" {
+	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.UserID) == "" || !validate.Text(req.UserID, 128) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id is required"})
 	}
 	s, err := a.Token(req.UserID)

@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+
+	"github.com/Samk416/seatres/internal/validate"
 )
 
 const defaultPerUserLimit = 4 // private package level variable
@@ -36,38 +38,27 @@ func badRequest(c *fiber.Ctx, msg string) error {
 
 func (h *Handler) Create(c *fiber.Ctx) error {
 	var req createReq
-
-	err := c.BodyParser(&req)
-	if err != nil {
-		log.Error().Err(err).Msg("Error in parsing request body")
-		return err
+	if err := c.BodyParser(&req); err != nil {
+		return badRequest(c, "invalid JSON")
 	}
 
 	req.Name = strings.TrimSpace(req.Name)
-	if req.Name == "" {
-		log.Error().Err(err).Msg("name is required")
-		return badRequest(c, "name is required")
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || !validate.Text(req.Name, 200) {
+		return badRequest(c, "name is required (max 200 characters)")
 	}
-
-	if len(req.Seats) == 0 {
-		log.Error().Err(err).Msg("seats must not be empty")
-		return badRequest(c, "seats must not be empty")
+	if len(req.Seats) == 0 || len(req.Seats) > 100000 {
+		return badRequest(c, "seats must contain 1 to 100000 entries")
 	}
-
-	if req.PricePaise < 0 {
-		log.Error().Err(err).Msg("price paise must be more than 0")
-		return badRequest(c, "price paise muse ge more than 0")
+	if req.PricePaise < 0 || req.PricePaise > 1_000_000_000_000 {
+		return badRequest(c, "price_paise must be between 0 and 1000000000000")
 	}
-
 	seen := make(map[string]struct{}, len(req.Seats))
 	for _, s := range req.Seats {
-		if s == "" {
-			log.Error().Err(err).Msg("seat name must not be empty")
-			return badRequest(c, "seat name must not be empty")
+		if s == "" || !validate.Text(s, 32) {
+			return badRequest(c, "seat names must be 1 to 32 valid characters")
 		}
-		_, dup := seen[s]
-		if dup {
-			log.Error().Err(err).Msg("duplicate seat")
+		if _, dup := seen[s]; dup {
 			return badRequest(c, "duplicate seat: "+s)
 		}
 		seen[s] = struct{}{}

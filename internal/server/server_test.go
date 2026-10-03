@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -407,4 +409,152 @@ func TestCancelRaces(t *testing.T) {
 	if st.confirmed != rc[201] || st.available+st.held+st.confirmed != st.total {
 		t.Fatalf("bad state: %+v (rebook wins: %d)", st, rc[201])
 	}
+}
+
+func (e *env) raw(method, path, token, body string) int {
+	req, _ := http.NewRequest(method, e.base+path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// Nasty input must always produce a clean 4xx, never a 5xx.
+func TestBadInputNever5xx(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2"})
+	tok, _ := e.a.Token("fuzz-user")
+	reserve := "/shows/" + id + "/reserve"
+	long := strings.Repeat("x", 300)
+	many := `"S1","S2","S3","S4","S5","S6","S7","S8","S9","S10","S11","S12","S13","S14","S15","S16","S17","S18","S19","S20","S21"`
+	admin := "/shows"
+
+	cases := []struct {
+		name, method, path, token, body string
+		want                            int // 0 = any 4xx
+	}{
+		{"invalid json", "POST", reserve, tok, `{`, 400},
+		{"empty body", "POST", reserve, tok, ``, 400},
+		{"seats wrong type", "POST", reserve, tok, `{"seats":"A1","idempotency_key":"k"}`, 400},
+		{"no idempotency key", "POST", reserve, tok, `{"seats":["A1"]}`, 400},
+		{"NUL in key", "POST", reserve, tok, `{"seats":["A1"],"idempotency_key":"a\u0000b"}`, 400},
+		{"key too long", "POST", reserve, tok, `{"seats":["A1"],"idempotency_key":"` + long + `"}`, 400},
+		{"empty seats", "POST", reserve, tok, `{"seats":[],"idempotency_key":"k"}`, 400},
+		{"null seat", "POST", reserve, tok, `{"seats":[null],"idempotency_key":"k"}`, 400},
+		{"NUL in seat", "POST", reserve, tok, `{"seats":["A\u00001"],"idempotency_key":"k"}`, 400},
+		{"seat too long", "POST", reserve, tok, `{"seats":["` + long + `"],"idempotency_key":"k"}`, 400},
+		{"duplicate seats", "POST", reserve, tok, `{"seats":["A1","A1"],"idempotency_key":"k"}`, 400},
+		{"21 seats", "POST", reserve, tok, `{"seats":[` + many + `],"idempotency_key":"k"}`, 400},
+		{"bad show id", "POST", "/shows/abc/reserve", tok, `{"seats":["A1"],"idempotency_key":"k"}`, 400},
+		{"unknown show", "POST", "/shows/22222222-2222-2222-2222-222222222222/reserve", tok, `{"seats":["A1"],"idempotency_key":"k"}`, 404},
+		{"unknown seat", "POST", reserve, tok, `{"seats":["Z99"],"idempotency_key":"k"}`, 404},
+		{"no token", "POST", reserve, "", `{"seats":["A1"],"idempotency_key":"k"}`, 401},
+		{"garbage token", "POST", reserve, "not-a-jwt", `{"seats":["A1"],"idempotency_key":"k"}`, 401},
+		{"user token on admin route", "POST", admin, tok, `{"name":"x","seats":["A1"],"price_paise":1}`, 403},
+		{"admin: NUL in name", "POST", admin, adminToken, `{"name":"a\u0000b","seats":["A1"],"price_paise":1}`, 400},
+		{"admin: negative price", "POST", admin, adminToken, `{"name":"x","seats":["A1"],"price_paise":-5}`, 400},
+		{"admin: float price", "POST", admin, adminToken, `{"name":"x","seats":["A1"],"price_paise":1e30}`, 400},
+		{"admin: max int64 price", "POST", admin, adminToken, `{"name":"x","seats":["A1"],"price_paise":9223372036854775807}`, 400},
+		{"admin: no seats", "POST", admin, adminToken, `{"name":"x","seats":[],"price_paise":1}`, 400},
+		{"admin: empty seat name", "POST", admin, adminToken, `{"name":"x","seats":[""],"price_paise":1}`, 400},
+		{"cancel bad id", "POST", "/reservations/abc/cancel", tok, ``, 400},
+		{"unknown route", "GET", "/nope", "", ``, 404},
+		{"wrong method", "DELETE", "/shows", "", ``, 0},
+		{"token: empty user", "POST", "/auth/token", "", `{"user_id":""}`, 400},
+		{"token: NUL user", "POST", "/auth/token", "", `{"user_id":"a\u0000b"}`, 400},
+	}
+	for _, tc := range cases {
+		got := e.raw(tc.method, tc.path, tc.token, tc.body)
+		if tc.want != 0 && got != tc.want {
+			t.Errorf("%s: want %d, got %d", tc.name, tc.want, got)
+		} else if tc.want == 0 && (got < 400 || got > 499) {
+			t.Errorf("%s: want a 4xx, got %d", tc.name, got)
+		}
+	}
+	if st := e.state(t, id); st.available != 2 || st.confirmed != 0 {
+		t.Fatalf("bad input must not change state: %+v", st)
+	}
+}
+
+// Everything at once: reserves, same-key retries, cancels, rebooks and reads.
+// Pass = zero 5xx, zero dropped requests, invariant holds.
+func TestMixedLoadNoServerErrors(t *testing.T) {
+	e := newEnv(t)
+	const totalSeats = 120
+	seats := make([]string, totalSeats)
+	for i := range seats {
+		seats[i] = fmt.Sprintf("S%d", i)
+	}
+	id := e.createShow(t, seats)
+	path := "/shows/" + id + "/reserve"
+
+	const users = 400
+	var mu sync.Mutex
+	codes := map[int]int{}
+	record := func(c int) {
+		mu.Lock()
+		codes[c]++
+		mu.Unlock()
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for u := 0; u < users; u++ {
+		wg.Add(1)
+		go func(u int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(u)))
+			tok, _ := e.a.Token(fmt.Sprintf("chaos-%d", u))
+			pick := func() []string {
+				n := 1 + rng.Intn(3)
+				set := map[string]bool{}
+				for len(set) < n {
+					i := rng.Intn(totalSeats)
+					if rng.Intn(10) < 7 {
+						i = rng.Intn(10) // 70% of traffic fights over 10 hot seats
+					}
+					set[seats[i]] = true
+				}
+				out := make([]string, 0, n)
+				for s := range set {
+					out = append(out, s)
+				}
+				return out
+			}
+
+			<-start
+			body := map[string]any{"seats": pick(), "idempotency_key": "c1"}
+			c, out := e.do("POST", path, tok, body)
+			record(c)
+			c, _ = e.do("POST", path, tok, body) // client retry, same key
+			record(c)
+			if rid, ok := out["reservation_id"].(string); ok && rng.Intn(2) == 0 {
+				c, _ = e.do("POST", "/reservations/"+rid+"/cancel", tok, nil)
+				record(c)
+			}
+			c, _ = e.do("POST", path, tok, map[string]any{"seats": pick(), "idempotency_key": "c2"})
+			record(c)
+			c, _ = e.do("GET", "/shows/"+id, "", nil)
+			record(c)
+		}(u)
+	}
+	close(start)
+	wg.Wait()
+
+	for code, n := range codes {
+		if code != 200 && code != 201 && code != 409 {
+			t.Errorf("unexpected status %d (x%d)", code, n)
+		}
+	}
+	st := e.state(t, id)
+	if st.total != totalSeats || st.available+st.held+st.confirmed != st.total {
+		t.Fatalf("invariant broken: %+v", st)
+	}
+	t.Logf("outcomes: %v  final state: %+v", codes, st)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Samk416/seatres/internal/auth"
+	"github.com/Samk416/seatres/internal/validate"
 )
 
 const maxSeatsPerRequest = 20
@@ -63,8 +64,8 @@ func normalizeSeats(in []string) ([]string, string) {
 	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		if s == "" {
-			return nil, "seat name must not be empty"
+		if s == "" || !validate.Text(s, 32) {
+			return nil, "seat names must be 1 to 32 valid characters"
 		}
 		if _, dup := seen[s]; dup {
 			return nil, "duplicate seat in request: " + s
@@ -97,8 +98,8 @@ func (h *Handler) Reserve(c *fiber.Ctx) error {
 	if key == "" {
 		key = strings.TrimSpace(req.IdempotencyKey)
 	}
-	if key == "" {
-		return bad(c, "idempotency key required (Idempotency-Key header or idempotency_key field)")
+	if key == "" || !validate.Text(key, 200) {
+		return bad(c, "idempotency key required (1-200 valid characters; Idempotency-Key header or idempotency_key field)")
 	}
 	seats, msg := normalizeSeats(req.Seats)
 	if msg != "" {
@@ -108,7 +109,13 @@ func (h *Handler) Reserve(c *fiber.Ctx) error {
 	// Identity comes ONLY from the verified token.
 	userID := auth.UserID(c)
 
-	res, replayed, err := h.reserve(c.UserContext(), showID, userID, key, seats)
+	var res *result
+	var replayed bool
+	err = withRetry(c.UserContext(), func() error {
+		var e error
+		res, replayed, e = h.reserve(c.UserContext(), showID, userID, key, seats)
+		return e
+	})
 	var d *decline
 	if errors.As(err, &d) {
 		return c.Status(d.Status).JSON(fiber.Map{"error": d.Reason, "message": d.Msg})
@@ -250,7 +257,12 @@ func (h *Handler) Cancel(c *fiber.Ctx) error {
 	}
 	userID := auth.UserID(c) // identity from the token only
 
-	res, err := h.cancel(c.UserContext(), resID, userID)
+	var res *result
+	err = withRetry(c.UserContext(), func() error {
+		var e error
+		res, e = h.cancel(c.UserContext(), resID, userID)
+		return e
+	})
 	var d *decline
 	if errors.As(err, &d) {
 		return c.Status(d.Status).JSON(fiber.Map{"error": d.Reason, "message": d.Msg})
