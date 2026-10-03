@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ type env struct {
 	client  *http.Client
 	sem     chan struct{}
 	errOnce sync.Once
+	runID   string
 }
 
 func newEnv(t *testing.T) *env {
@@ -47,24 +49,42 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	go app.Listener(ln)
-	t.Cleanup(func() { _ = app.Shutdown() })
 
-	return &env{
-		base: "http://" + ln.Addr().String(),
-		a:    a,
-		sem:  make(chan struct{}, 100), // at most 100 requests in flight
+	e := &env{
+		base:  "http://" + ln.Addr().String(),
+		a:     a,
+		sem:   make(chan struct{}, 100), // at most 100 requests in flight
+		runID: strconv.FormatInt(time.Now().UnixNano(), 36),
 		client: &http.Client{
 			Timeout:   60 * time.Second,
 			Transport: &http.Transport{MaxIdleConns: 2000, MaxIdleConnsPerHost: 2000},
 		},
 	}
+	t.Cleanup(func() {
+		e.client.CloseIdleConnections()              // client drops its keep-alive connections first
+		_ = app.ShutdownWithTimeout(3 * time.Second) // and shutdown can never wait forever
+	})
+	return e
+
 }
 
 // do sends a request. Status 0 means a network-level failure.
+// do sends a request. Status 0 means a network-level failure.
 func (e *env) do(method, path, token string, body any) (int, map[string]any) {
-
 	e.sem <- struct{}{}
 	defer func() { <-e.sem }()
+
+	// Make idempotency keys unique per test run (the DB persists between runs).
+	if m, ok := body.(map[string]any); ok {
+		if k, ok := m["idempotency_key"].(string); ok {
+			cp := make(map[string]any, len(m))
+			for kk, vv := range m {
+				cp[kk] = vv
+			}
+			cp["idempotency_key"] = k + "-" + e.runID
+			body = cp
+		}
+	}
 
 	var buf bytes.Buffer
 	if body != nil {
@@ -279,5 +299,112 @@ func TestIdempotencyConcurrent(t *testing.T) {
 	st := e.state(t, id)
 	if st.confirmed != 1 || st.available != 1 {
 		t.Fatalf("expected exactly one seat booked: %+v", st)
+	}
+}
+
+func (e *env) reserveSeat(showID, token, key string, seats ...string) (int, string) {
+	code, out := e.do("POST", "/shows/"+showID+"/reserve", token,
+		map[string]any{"seats": seats, "idempotency_key": key})
+	id, _ := out["reservation_id"].(string)
+	return code, id
+}
+
+// Owner-only cancel, rebook after cancel, and a stale cancel must never
+// free a seat that now belongs to someone else.
+func TestCancelOwnerOnlyAndNoResurrection(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2"})
+	alice, _ := e.a.Token("alice")
+	bob, _ := e.a.Token("bob")
+
+	code, resA := e.reserveSeat(id, alice, "ka", "A1")
+	if code != 201 {
+		t.Fatalf("alice reserve: want 201, got %d", code)
+	}
+	cancel := "/reservations/" + resA + "/cancel"
+
+	if c, _ := e.do("POST", cancel, bob, nil); c != 403 {
+		t.Fatalf("bob cancelling alice's reservation: want 403, got %d", c)
+	}
+	if c, _ := e.do("POST", cancel, "", nil); c != 401 {
+		t.Fatalf("no token: want 401, got %d", c)
+	}
+	if st := e.state(t, id); st.confirmed != 1 {
+		t.Fatalf("seat must still be confirmed: %+v", st)
+	}
+	if c, _ := e.do("POST", "/reservations/00000000-0000-0000-0000-000000000000/cancel", alice, nil); c != 404 {
+		t.Fatalf("unknown reservation: want 404, got %d", c)
+	}
+	if c, _ := e.do("POST", "/reservations/abc/cancel", alice, nil); c != 400 {
+		t.Fatalf("bad id: want 400, got %d", c)
+	}
+
+	if c, _ := e.do("POST", cancel, alice, nil); c != 200 {
+		t.Fatalf("alice cancel: want 200, got %d", c)
+	}
+	if st := e.state(t, id); st.confirmed != 0 || st.available != 2 {
+		t.Fatalf("seat should be free again: %+v", st)
+	}
+
+	// The released seat is re-bookable.
+	if code, _ := e.reserveSeat(id, bob, "kb", "A1"); code != 201 {
+		t.Fatalf("bob rebook: want 201, got %d", code)
+	}
+
+	// Alice retries her old cancel: succeeds, but must NOT free bob's seat.
+	if c, _ := e.do("POST", cancel, alice, nil); c != 200 {
+		t.Fatalf("stale cancel: want 200, got %d", c)
+	}
+	if st := e.state(t, id); st.confirmed != 1 || st.available != 1 {
+		t.Fatalf("stale cancel resurrected a seat: %+v", st)
+	}
+}
+
+// 30 parallel cancels of one reservation racing 30 users trying to rebook
+// one of its seats: no 5xx, at most one rebooker wins, invariant holds.
+func TestCancelRaces(t *testing.T) {
+	e := newEnv(t)
+	id := e.createShow(t, []string{"A1", "A2"})
+	owner, _ := e.a.Token("owner")
+	code, resID := e.reserveSeat(id, owner, "k-owner", "A1", "A2")
+	if code != 201 {
+		t.Fatalf("owner reserve: want 201, got %d", code)
+	}
+
+	const n = 30
+	cancelCodes := make([]int, n)
+	rebookCodes := make([]int, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			cancelCodes[i], _ = e.do("POST", "/reservations/"+resID+"/cancel", owner, nil)
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			tok, _ := e.a.Token(fmt.Sprintf("rb-%d", i))
+			<-start
+			rebookCodes[i], _ = e.do("POST", "/shows/"+id+"/reserve", tok, map[string]any{
+				"seats":           []string{"A1"},
+				"idempotency_key": fmt.Sprintf("rb-key-%d", i),
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if cc := tally(cancelCodes); cc[200] != n {
+		t.Fatalf("want %dx200 for cancels, got %v", n, cc)
+	}
+	rc := tally(rebookCodes)
+	if rc[201] > 1 || rc[201]+rc[409] != n {
+		t.Fatalf("rebook outcomes wrong: %v", rc)
+	}
+	st := e.state(t, id)
+	if st.confirmed != rc[201] || st.available+st.held+st.confirmed != st.total {
+		t.Fatalf("bad state: %+v (rebook wins: %d)", st, rc[201])
 	}
 }

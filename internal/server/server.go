@@ -21,5 +21,6 @@ func New(pool *pgxpool.Pool, a *auth.Auth) *fiber.App {
 	app.Post("/shows", a.RequireAdmin, sh.Create)
 	app.Get("/shows/:id", sh.Get)
 	app.Post("/shows/:id/reserve", a.RequireUser, rh.Reserve)
+	app.Post("/reservations/:id/cancel", a.RequireUser, rh.Cancel)
 	return app
 }

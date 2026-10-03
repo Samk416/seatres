@@ -241,3 +241,74 @@ func (h *Handler) reserve(ctx context.Context, showID uuid.UUID, userID, key str
 		Status:        "confirmed",
 	}, false, nil
 }
+
+// POST /reservations/:id/cancel
+func (h *Handler) Cancel(c *fiber.Ctx) error {
+	resID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return bad(c, "invalid reservation id")
+	}
+	userID := auth.UserID(c) // identity from the token only
+
+	res, err := h.cancel(c.UserContext(), resID, userID)
+	var d *decline
+	if errors.As(err, &d) {
+		return c.Status(d.Status).JSON(fiber.Map{"error": d.Reason, "message": d.Msg})
+	}
+	if err != nil {
+		return err
+	}
+	return c.JSON(res)
+}
+
+func (h *Handler) cancel(ctx context.Context, resID uuid.UUID, userID string) (*result, error) {
+	tx, err := h.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the reservation row: concurrent cancels of it queue up here.
+	var res result
+	err = tx.QueryRow(ctx,
+		`SELECT id::text, show_id::text, user_id, amount_paise, status, seats
+		   FROM reservations WHERE id = $1 FOR UPDATE`,
+		resID.String()).Scan(&res.ReservationID, &res.ShowID, &res.UserID,
+		&res.AmountPaise, &res.Status, &res.Seats)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &decline{404, "reservation_not_found", "reservation not found"}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if res.UserID != userID {
+		return nil, &decline{403, "forbidden", "you can only cancel your own reservations"}
+	}
+
+	// Already cancelled: succeed without touching anything (idempotent).
+	if res.Status == "cancelled" {
+		return &res, nil
+	}
+
+	if _, err = tx.Exec(ctx,
+		`UPDATE reservations SET status = 'cancelled' WHERE id = $1`,
+		resID.String()); err != nil {
+		return nil, err
+	}
+
+	// Only seats that still belong to THIS reservation are released.
+	if _, err = tx.Exec(ctx,
+		`UPDATE seats
+		    SET status = 'available', user_id = NULL, reservation_id = NULL
+		  WHERE reservation_id = $1 AND status = 'confirmed'`,
+		resID.String()); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	res.Status = "cancelled"
+	return &res, nil
+}

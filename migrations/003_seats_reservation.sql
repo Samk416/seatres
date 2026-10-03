@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx_seats_reservation ON seats (reservation_id);
